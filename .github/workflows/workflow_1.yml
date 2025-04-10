@@ -1,0 +1,181 @@
+name: 为Android ARM64构建Python和zlib
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装依赖项
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential zlib1g-dev libffi-dev libssl-dev libbz2-dev \
+                              libreadline-dev libsqlite3-dev wget curl llvm libncurses5-dev \
+                              libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev \
+                              liblzma-dev git tar python3 python3-pip unzip binutils
+          if [ -f /usr/include/lzma.h ]; then
+            echo "liblzma-dev 已安装，lzma.h 存在。"
+          else
+            echo "liblzma-dev 安装失败，lzma.h 未找到！"
+            exit 1
+          fi
+          python3 --version
+          pip3 --version
+          echo "依赖项安装完成"
+
+      - name: 缓存Android NDK
+        uses: actions/cache@v4
+        with:
+          path: ~/android-ndk
+          key: android-ndk-r21e
+
+      - name: 下载并设置Android NDK r21e
+        run: |
+          echo "检查可用磁盘空间："
+          df -h
+          if [ -d "$HOME/android-ndk/android-ndk-r21e" ]; then
+            echo "NDK r21e 已存在，跳过下载。"
+          else
+            echo "正在下载 NDK r21e..."
+            mkdir -p ~/android-ndk || { echo "创建目录失败"; exit 1; }
+            wget -O ~/android-ndk/android-ndk-r21e-linux.zip https://dl.google.com/android/repository/android-ndk-r21e-linux-x86_64.zip || { echo "下载失败"; exit 1; }
+            echo "检查下载文件大小："
+            ls -lh ~/android-ndk/android-ndk-r21e-linux.zip
+            echo "解压 NDK r21e..."
+            unzip -o -d ~/android-ndk ~/android-ndk/android-ndk-r21e-linux.zip || { echo "解压失败"; exit 1; }
+            if [ -d "$HOME/android-ndk/android-ndk-r21e" ]; then
+              echo "解压成功，NDK r21e 目录存在。"
+            else
+              echo "解压后 NDK r21e 目录不存在！"
+              exit 1
+            fi
+          fi
+          export ANDROID_NDK_HOME=$HOME/android-ndk/android-ndk-r21e
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+          echo "$ANDROID_NDK_HOME" >> $GITHUB_PATH
+          echo "NDK r21e 设置完成"
+
+      - name: 检查Python版本并下载匹配源码
+        run: |
+          REQUIRED_PYTHON_VERSION=$(python3 --version | grep -oP '\d+\.\d+\.\d+')
+          echo "检测到系统Python版本：$REQUIRED_PYTHON_VERSION"
+          if [ -d "cpython" ] && grep -q "$REQUIRED_PYTHON_VERSION" cpython/PC/pyconfig.h 2>/dev/null; then
+            echo "Python $REQUIRED_PYTHON_VERSION 源码已存在。"
+          else
+            echo "下载并准备Python $REQUIRED_PYTHON_VERSION 源码..."
+            wget https://www.python.org/ftp/python/$REQUIRED_PYTHON_VERSION/Python-$REQUIRED_PYTHON_VERSION.tgz || { echo "源码下载失败"; exit 1; }
+            tar -xf Python-$REQUIRED_PYTHON_VERSION.tgz
+            rm -rf cpython
+            mv Python-$REQUIRED_PYTHON_VERSION cpython
+          fi
+
+      - name: 下载并解压zlib
+        run: |
+          wget https://github.com/madler/zlib/archive/refs/tags/v1.3.1.tar.gz -O zlib-1.3.1.tar.gz
+          tar -xvf zlib-1.3.1.tar.gz
+          cd zlib-1.3.1
+          echo "zlib源码解压完成"
+
+      - name: 设置交叉编译工具
+        run: |
+          export CROSS_COMPILE=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android-
+          export READELF=$(which readelf)
+          if [ -f "$READELF" ]; then
+            echo "readelf已存在"
+          else
+            sudo apt install -y binutils
+            export READELF=$(which readelf)
+          fi
+          echo "READELF=$READELF" >> $GITHUB_ENV
+          export AR=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android-ar
+          echo "AR=$AR" >> $GITHUB_ENV
+          echo "交叉编译工具设置完成"
+
+      - name: 配置并编译Python
+        run: |
+          cd cpython
+          export CONFIG_SITE=config.site
+          cat <<EOF > $CONFIG_SITE
+          ac_cv_file__dev_ptmx=yes
+          ac_cv_file__dev_ptc=no
+          EOF
+
+          BUILD_PYTHON=$(which python3)
+          echo "使用构建Python版本："
+          $BUILD_PYTHON --version
+          export SYSROOT=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+          export CFLAGS="-I$SYSROOT/usr/include --sysroot=$SYSROOT"
+          export LDFLAGS="-L$SYSROOT/usr/lib/aarch64-linux-android/21 --sysroot=$SYSROOT -fuse-ld=lld"
+          unset LD
+          unset LD_LIBRARY_PATH
+          ./configure --host=aarch64-linux-android --build=x86_64-linux-gnu \
+                      --disable-optimizations \
+                      --disable-ipv6 \
+                      --with-build-python=$BUILD_PYTHON \
+                      CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
+                      CXX=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++ \
+                      AR=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android-ar \
+                      RANLIB=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android-ranlib \
+                      READELF=$READELF
+
+          echo "配置完成"
+          make -j$(nproc) || { echo "编译失败，检查日志"; exit 1; }
+          if [ -f config.log ]; then
+            echo "上传 config.log..."
+            cp config.log $GITHUB_WORKSPACE/config.log
+          fi
+          echo "Python编译完成"
+
+      - name: 编译zlib
+        run: |
+          cd zlib-1.3.1
+          ./configure
+          make -j$(nproc)
+          echo "zlib编译完成"
+
+      - name: 将Python和zlib安装到模拟Android根目录（/data）
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/android-rootfs/data
+          cd cpython
+          make install prefix=$GITHUB_WORKSPACE/android-rootfs/data
+          cd ../zlib-1.3.1
+          make install prefix=$GITHUB_WORKSPACE/android-rootfs/data
+          echo "android-rootfs/data目录内容："
+          ls -lh $GITHUB_WORKSPACE/android-rootfs/data
+
+      - name: 打包已安装的Python和zlib
+        run: |
+          tar -czvf python-zlib-android-data.tar.gz -C android-rootfs/data .
+          echo "二进制打包完成"
+
+      - name: 打包构建二进制所用的源码
+        run: |
+          tar -czvf python-zlib-source.tar.gz cpython zlib-1.3.1
+          echo "源码打包完成"
+
+      - name: 上传Python和zlib二进制包
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-zlib-android-data
+          path: python-zlib-android-data.tar.gz
+
+      - name: 上传Python和zlib源码包
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-zlib-source
+          path: python-zlib-source.tar.gz
+
+      - name: 上传config.log（调试用）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-log
+          path: ${{ github.workspace }}/config.log
